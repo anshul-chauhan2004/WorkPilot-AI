@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "/Users/anshulchauhan/WorkPilot-AI/backend/venv/bin/python",
+  "python.analysis.extraPaths": [
+    "/Users/anshulchauhan/WorkPilot-AI/backend"
+  ],
+  "python.terminal.activateEnvironment": true,
+  "python.terminal.useEnvFile": true
+}
