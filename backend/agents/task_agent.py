@@ -32,6 +32,7 @@ from typing import Any
 import google.generativeai as genai
 
 from config import settings
+from tools.task_tools import save_plan_to_db, get_tasks_summary
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are the WorkPilot Task Agent — an expert work planner and onboarding specialist.
@@ -106,13 +107,18 @@ def _get_model() -> genai.GenerativeModel:
 
 
 # ── Agent Entry Point ─────────────────────────────────────────────────────────
-def run(user_input: str, conversation_history: list[dict]) -> dict[str, Any]:
+def run(
+    user_input: str,
+    conversation_history: list[dict],
+    conversation_id: str | None = None,
+) -> dict[str, Any]:
     """
     Execute the Task Agent.
 
     Args:
-        user_input: Employee's goal or planning request.
+        user_input:           Employee's goal or planning request.
         conversation_history: Recent conversation for role/context hints.
+        conversation_id:      Chat session ID (used to link saved tasks to the chat).
 
     Returns:
         {
@@ -134,7 +140,7 @@ def run(user_input: str, conversation_history: list[dict]) -> dict[str, Any]:
         context_block = "CONVERSATION HISTORY:\n" + "\n".join(context_lines) + "\n\n"
 
     prompt = f"{context_block}PLANNING REQUEST:\n{user_input}"
-
+    response = None  # initialized before try so except clauses can safely reference it
     try:
         model = _get_model()
         response = model.generate_content(prompt)
@@ -150,22 +156,45 @@ def run(user_input: str, conversation_history: list[dict]) -> dict[str, Any]:
         structured.setdefault("dependencies_map", {})
         structured.setdefault("notes", "")
 
+        # ── Persist tasks to SQLite (Phase 3) ────────────────────────────────
+        saved_ids: list[str] = []
+        tools_called: list[str] = []
+        try:
+            saved_ids = save_plan_to_db(structured, conversation_id=conversation_id)
+            tools_called = ["save_plan_to_db"]
+        except Exception as save_err:
+            # Non-fatal — agent still returns plan even if DB save fails
+            tools_called = [f"save_plan_to_db:ERROR:{save_err}"]
+
         task_count = len(structured["tasks"])
+        saved_count = len(saved_ids)
         total_hours = structured["total_estimated_hours"]
         high_priority = sum(1 for t in structured["tasks"] if t.get("priority") == "high")
+
+        # Build human-readable response
+        save_line = (
+            f"✅ Saved {saved_count} tasks to your task board."
+            if saved_count > 0
+            else "⚠️ Could not save tasks to DB — plan generated but not persisted."
+        )
+        board_summary = get_tasks_summary()
+
+        notes_line = f"\n\n{structured['notes']}" if structured["notes"] else ""
 
         final_response = (
             f"**{structured['plan_title']}** ({structured['plan_type'].replace('_', ' ').title()})\n\n"
             f"Created **{task_count} tasks** totalling ~{total_hours} hours. "
             f"**{high_priority} high-priority** task(s) to start immediately.\n\n"
-            f"{structured['notes']}" if structured["notes"] else ""
+            f"{save_line}\n"
+            f"{board_summary}"
+            f"{notes_line}"
         ).strip()
 
         duration_ms = int((time.time() - start) * 1000)
         return {
             "structured_response": structured,
             "final_response": final_response,
-            "tools_called": [],   # Phase 3 will add create_task(), save_to_db()
+            "tools_called": tools_called,
             "duration_ms": duration_ms,
             "error": None,
         }

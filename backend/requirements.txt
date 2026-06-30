@@ -1,27 +1,25 @@
 # WorkPilot AI — Backend Dependencies
 # Install: pip install -r requirements.txt
 
-# API framework
+# ── Core API ──────────────────────────────────────────────────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
+sse-starlette==2.1.3
+python-multipart==0.0.19
 
-# LangGraph agent framework
+# ── Agent Framework ───────────────────────────────────────────────────────────
 langgraph==0.2.55
 
-# Gemini SDK
+# ── LLM & Embeddings ─────────────────────────────────────────────────────────
 google-generativeai==0.8.3
 
-# SSE streaming
-sse-starlette==2.1.3
+# ── Phase 2: RAG Pipeline ─────────────────────────────────────────────────────
+PyMuPDF==1.24.12          # PDF parsing (imported as fitz)
+chromadb==0.5.23          # local persistent vector store
 
-# Database
+# ── Database ──────────────────────────────────────────────────────────────────
 sqlalchemy==2.0.36
 
-# Environment & config
+# ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
-
-# Data validation
 pydantic==2.10.3
-
-# File uploads (Phase 2+)
-python-multipart==0.0.19

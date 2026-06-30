@@ -1,15 +1,14 @@
 """
-agents/document_agent.py — WorkPilot Document Agent
+agents/document_agent.py — WorkPilot Document Agent (Phase 2: ChromaDB-aware)
 
 Responsibility:
-    Analyze, summarize, and extract structured insights from business documents
-    including reports, contracts, meeting notes, policies, and proposals.
+    Analyze, summarize, and extract structured insights from business documents.
 
-Unique traits:
-    - Prioritizes actionable information (tasks, deadlines, decisions)
-    - Classifies the document type automatically
-    - Flags risks, conflicts, or items needing urgent attention
-    - Structures output for quick executive scanning
+Phase 2 upgrade:
+    - If a doc_id is detected in the user message, retrieves chunks from that
+      specific document in ChromaDB (enables "summarize document X" flows)
+    - Falls back to analyzing pasted text directly (Phase 1 behavior preserved)
+    - Extracts action items, deadlines, decisions, and risk flags
 
 Structured output schema:
     {
@@ -20,6 +19,7 @@ Structured output schema:
         "deadlines":        list  — dates and deadlines found
         "decisions_made":   list  — decisions or approvals recorded
         "risks_or_flags":   list  — items needing urgent attention
+        "source":           str   — "uploaded_doc" | "pasted_text"
     }
 """
 
@@ -30,8 +30,11 @@ from typing import Any
 import google.generativeai as genai
 
 from config import settings
+from db.chroma_client import collection_count
+from tools.retriever import retrieve_for_document, format_context_block
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
+
 SYSTEM_PROMPT = """You are the WorkPilot Document Agent — an expert analyst specializing in business document intelligence.
 
 YOUR ROLE:
@@ -71,13 +74,13 @@ YOU MUST respond in this exact JSON format — no extra text, no markdown, only 
     ],
     "risks_or_flags": [
         "Item requiring urgent attention, clarification, or legal review"
-    ]
-}
-
-If the user has not pasted document content and is only asking about documents conceptually, answer their question about documents generally and set all lists to empty."""
+    ],
+    "source": "uploaded_doc | pasted_text"
+}"""
 
 
 # ── Gemini Client ─────────────────────────────────────────────────────────────
+
 def _get_model() -> genai.GenerativeModel:
     genai.configure(api_key=settings.GEMINI_API_KEY)
     return genai.GenerativeModel(
@@ -85,19 +88,35 @@ def _get_model() -> genai.GenerativeModel:
         system_instruction=SYSTEM_PROMPT,
         generation_config=genai.GenerationConfig(
             response_mime_type="application/json",
-            temperature=0.1,        # very low — document extraction must be precise
-            max_output_tokens=2048, # documents can have many action items
+            temperature=0.1,
+            max_output_tokens=2048,
         ),
     )
 
 
+def _extract_doc_id(text: str) -> str | None:
+    """
+    Check if the user message contains a doc_id (UUID format).
+    Used to route to ChromaDB retrieval for a specific document.
+    """
+    import re
+    uuid_pattern = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    match = re.search(uuid_pattern, text, re.IGNORECASE)
+    return match.group(0) if match else None
+
+
 # ── Agent Entry Point ─────────────────────────────────────────────────────────
+
 def run(user_input: str, conversation_history: list[dict]) -> dict[str, Any]:
     """
     Execute the Document Agent.
 
+    Phase 2 routing:
+        1. Check if user message contains a doc_id → retrieve from ChromaDB
+        2. Otherwise → analyze text pasted directly in the message (Phase 1 behavior)
+
     Args:
-        user_input: User message — may contain raw document text or a document query.
+        user_input:           User message — may contain a doc_id UUID or raw document text.
         conversation_history: Recent conversation for context.
 
     Returns:
@@ -110,22 +129,46 @@ def run(user_input: str, conversation_history: list[dict]) -> dict[str, Any]:
         }
     """
     start = time.time()
+    tools_called = []
+    doc_content = user_input
+    source_label = "pasted_text"
 
-    context_block = ""
+    # ── Step 1: Try to retrieve from ChromaDB by doc_id ──────────────────────
+    doc_id = _extract_doc_id(user_input)
+    if doc_id and collection_count() > 0:
+        try:
+            # Use the full user message as the query to find most relevant chunks
+            query = user_input.replace(doc_id, "").strip() or "summarize this document"
+            chunks = retrieve_for_document(query, doc_id=doc_id, n_results=10)
+            tools_called.append("retrieve_for_document")
+
+            if chunks:
+                doc_content = format_context_block(chunks)
+                source_label = "uploaded_doc"
+        except Exception as e:
+            print(f"Document retrieval error (falling back to pasted text): {e}")
+
+    # ── Step 2: Build prompt ──────────────────────────────────────────────────
+    history_block = ""
     if conversation_history:
-        context_lines = [
+        history_lines = [
             f"{msg['role'].upper()}: {msg['content']}"
             for msg in conversation_history[-4:]
         ]
-        context_block = "CONVERSATION HISTORY:\n" + "\n".join(context_lines) + "\n\n"
+        history_block = "CONVERSATION HISTORY:\n" + "\n".join(history_lines) + "\n\n"
 
-    prompt = f"{context_block}DOCUMENT / REQUEST:\n{user_input}"
+    prompt = (
+        f"{history_block}"
+        f"DOCUMENT CONTENT TO ANALYZE:\n{doc_content}\n\n"
+        f"USER REQUEST: {user_input}"
+    )
 
+    # ── Step 3: Gemini inference ──────────────────────────────────────────────
+    response = None  # initialized here so except clauses can safely reference it
     try:
         model = _get_model()
         response = model.generate_content(prompt)
         raw_json = response.text.strip()
-
         structured = json.loads(raw_json)
 
         structured.setdefault("summary", "Document analysis complete.")
@@ -135,12 +178,12 @@ def run(user_input: str, conversation_history: list[dict]) -> dict[str, Any]:
         structured.setdefault("deadlines", [])
         structured.setdefault("decisions_made", [])
         structured.setdefault("risks_or_flags", [])
+        structured.setdefault("source", source_label)
 
-        # Build human-readable response
         action_count = len(structured["action_items"])
         risk_count = len(structured["risks_or_flags"])
         final_response = (
-            f"**Document Analysis Complete** ({structured['document_type']})\n\n"
+            f"**Document Analysis** ({structured['document_type']})\n\n"
             f"{structured['summary']}\n\n"
             f"Found **{action_count} action item(s)** and **{risk_count} flag(s)** requiring attention."
         )
@@ -149,7 +192,7 @@ def run(user_input: str, conversation_history: list[dict]) -> dict[str, Any]:
         return {
             "structured_response": structured,
             "final_response": final_response,
-            "tools_called": [],
+            "tools_called": tools_called,
             "duration_ms": duration_ms,
             "error": None,
         }
@@ -158,9 +201,13 @@ def run(user_input: str, conversation_history: list[dict]) -> dict[str, Any]:
         duration_ms = int((time.time() - start) * 1000)
         raw_text = getattr(response, "text", "No response generated.")
         return {
-            "structured_response": {"summary": raw_text, "document_type": "other", "key_points": [], "action_items": [], "deadlines": [], "decisions_made": [], "risks_or_flags": []},
+            "structured_response": {
+                "summary": raw_text, "document_type": "other",
+                "key_points": [], "action_items": [], "deadlines": [],
+                "decisions_made": [], "risks_or_flags": [], "source": source_label,
+            },
             "final_response": raw_text,
-            "tools_called": [],
+            "tools_called": tools_called,
             "duration_ms": duration_ms,
             "error": f"JSON parse error: {e}",
         }
@@ -169,7 +216,7 @@ def run(user_input: str, conversation_history: list[dict]) -> dict[str, Any]:
         return {
             "structured_response": {},
             "final_response": f"Document Agent encountered an error: {str(e)}",
-            "tools_called": [],
+            "tools_called": tools_called,
             "duration_ms": duration_ms,
             "error": str(e),
         }

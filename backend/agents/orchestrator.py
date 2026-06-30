@@ -173,7 +173,8 @@ def route_to_agent(state: WorkPilotState) -> str:
         "document": "document_agent",
         "task": "task_agent",
     }
-    return intent_map.get(state.get("intent", "knowledge"), "knowledge_agent")
+    intent = state.get("intent") or "knowledge"  # narrow str | None → str
+    return intent_map.get(intent, "knowledge_agent")
 
 
 # ── Node: Knowledge Agent ─────────────────────────────────────────────────────
@@ -252,7 +253,11 @@ def task_agent_node(state: WorkPilotState) -> WorkPilotState:
     """Node 2c: Run the Task Agent and record its trace step."""
     history = get_recent_messages(state["conversation_id"], limit=6)
 
-    result = task_agent_module.run(state["user_input"], history)
+    result = task_agent_module.run(
+        state["user_input"],
+        history,
+        conversation_id=state["conversation_id"],
+    )
 
     task_count = len(result["structured_response"].get("tasks", []))
     trace_step = {
@@ -307,10 +312,10 @@ def persist_trace_node(state: WorkPilotState) -> WorkPilotState:
         save_agent_log(
             conversation_id=state["conversation_id"],
             user_input=state["user_input"],
-            intent=state.get("intent", "unknown"),
-            intent_confidence=state.get("intent_confidence", "low"),
-            intent_reasoning=state.get("intent_reasoning", ""),
-            selected_agent=state.get("selected_agent", "unknown"),
+            intent=state.get("intent") or "unknown",
+            intent_confidence=state.get("intent_confidence") or "low",
+            intent_reasoning=state.get("intent_reasoning") or "",
+            selected_agent=state.get("selected_agent") or "unknown",
             tools_called=state.get("tools_called") or [],
             agent_response=state.get("agent_response") or {},
             final_response=final_resp,
